@@ -1,0 +1,159 @@
+#topic: log parsing — self‑contained, stdlib‑only, ~150 lines, argparse, and a built‑in self‑test.
+
+#!/usr/bin/env python3
+"""
+log_sleuth.py — quick Apache/Nginx access log triage
+
+Reads Combined/CLF-style logs from a file or STDIN and prints a short report:
+- Top talkers (IPs), top paths, status breakdown
+- Simple anomaly flags (SQLi patterns, sensitive file probes, scanner UAs, bursts of 401/403/404)
+- Optional self-test runs on synthetic sample logs
+
+Usage:
+  python log_sleuth.py /var/log/nginx/access.log --top 5
+  cat access.log | python log_sleuth.py
+  python log_sleuth.py --self-test
+"""
+import sys, re, argparse, collections, datetime
+
+# Regex for Common/Combined Log Format (tolerant of missing ref/UA)
+LOG_RE = re.compile(
+    r'(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<time>[^\]]+)\]\s+"(?P<method>\S+)\s+(?P<path>\S+)\s+(?P<proto>[^"]+)"\s+(?P<status>\d{3})\s+(?P<bytes>\S+)(?:\s+"(?P<ref>[^"]*)"\s+"(?P<ua>[^"]*)")?'
+)
+
+SQLI_RE = re.compile(r"(?:\bUNION\b|\bSELECT\b|%27|%22|%3C|%3E|--|\bOR\b\s*1=1|\bDROP\b|\bINSERT\b)", re.I)
+SENSITIVE_RE = re.compile(r"(\.\./|etc/passwd|/\.env|/\.git|wp-admin|wp-login|admin|phpmyadmin|/id_rsa|/server-status)", re.I)
+SCANNER_UA_RE = re.compile(r"(?:curl|python-requests|nikto|sqlmap|nmap|masscan|dirbuster|gobuster)", re.I)
+
+def parse_time(ts: str) -> datetime.datetime | None:
+    try:
+        return datetime.datetime.strptime(ts.split()[0], "%d/%b/%Y:%H:%M:%S")
+    except Exception:
+        return None
+
+def analyze(lines, top_n=5, burst_thresh=15):
+    ips = collections.Counter()
+    paths = collections.Counter()
+    codes = collections.Counter()
+    sqli = collections.Counter()
+    sensitive = collections.Counter()
+    badua = collections.Counter()
+    errors_by_ip = collections.Counter()
+    times_by_ip = collections.defaultdict(list)
+
+    total = 0
+    for ln in lines:
+        m = LOG_RE.search(ln)
+        if not m:
+            continue
+        total += 1
+        ip = m['ip']; path = m['path']; ua = m.group('ua') or ""
+        code = int(m['status'])
+        ips[ip] += 1
+        paths[path] += 1
+        codes[code] += 1
+        if SQLI_RE.search(path):
+            sqli[ip] += 1
+        if SENSITIVE_RE.search(path):
+            sensitive[ip] += 1
+        if (not ua.strip()) or SCANNER_UA_RE.search(ua):
+            badua[ip] += 1
+        if code in (401,403,404,500,502,503):
+            errors_by_ip[ip] += 1
+        t = parse_time(m['time'])
+        if t: times_by_ip[ip].append(t)
+
+    # Burst heuristic: > burst_thresh requests from an IP within any 60s window
+    bursters = {}
+    for ip, ts_list in times_by_ip.items():
+        ts_list.sort()
+        j = 0
+        for i in range(len(ts_list)):
+            while ts_list[i] - ts_list[j] > datetime.timedelta(seconds=60):
+                j += 1
+            window = i - j + 1
+            if window > burst_thresh:
+                bursters[ip] = max(bursters.get(ip, 0), window)
+
+    return {
+        "total": total,
+        "ips": ips.most_common(top_n),
+        "paths": paths.most_common(top_n),
+        "codes": sorted(codes.items()),
+        "sqli": sqli.most_common(top_n),
+        "sensitive": sensitive.most_common(top_n),
+        "badua": badua.most_common(top_n),
+        "errors": errors_by_ip.most_common(top_n),
+        "bursters": sorted(bursters.items(), key=lambda x: -x[1])[:top_n],
+    }
+
+def print_report(r, top_n):
+    print("== Log Sleuth Report ==")
+    print(f"Total parsed lines: {r['total']}")
+    print("\nTop IPs:")
+    for ip, c in r['ips']:
+        print(f"  {ip:<15} {c}")
+    print("\nTop Paths:")
+    for p, c in r['paths']:
+        print(f"  {c:>5} {p}")
+    print("\nStatus Codes:")
+    for code, c in r['codes']:
+        print(f"  {code}: {c}")
+    print("\nAnomalies (top {top_n} each):")
+    def section(title, items, label="hits"):
+        print(f"  - {title}:")
+        if not items:
+            print("      (none)")
+        for k, c in items:
+            print(f"      {k}: {c} {label}")
+    section("SQLi-like paths", r['sqli'])
+    section("Sensitive-file probes", r['sensitive'])
+    section("Scanner/empty UA", r['badua'])
+    section("Repeated errors (401/403/404/5xx)", r['errors'])
+    if r['bursters']:
+        print("  - Burst traffic (>60s window):")
+        for ip, w in r['bursters']:
+            print(f"      {ip}: {w} req/min peak")
+    print("\nTip: Re-run with a larger --top for deeper lists, or pipe grep to scope by vhost/path/status.")
+
+SAMPLE_LOG = """\
+192.0.2.10 - - [10/Oct/2025:13:55:36 +0000] "GET /index.html HTTP/1.1" 200 1024 "-" "Mozilla/5.0"
+203.0.113.77 - - [10/Oct/2025:13:55:40 +0000] "GET /wp-login.php HTTP/1.1" 404 512 "-" "curl/8.4.0"
+203.0.113.77 - - [10/Oct/2025:13:55:41 +0000] "GET /admin HTTP/1.1" 403 123 "-" "curl/8.4.0"
+203.0.113.77 - - [10/Oct/2025:13:55:42 +0000] "GET /?q=1%20UNION%20SELECT%201 HTTP/1.1" 200 256 "-" "curl/8.4.0"
+198.51.100.5 - - [10/Oct/2025:13:55:44 +0000] "GET /.env HTTP/1.1" 404 12 "-" "-"
+198.51.100.5 - - [10/Oct/2025:13:55:45 +0000] "GET /etc/passwd HTTP/1.1" 404 12 "-" "-"
+192.0.2.10 - - [10/Oct/2025:13:55:46 +0000] "GET /index.html HTTP/1.1" 200 1024 "-" "Mozilla/5.0"
+"""
+
+def self_test():
+    print("Running self-test on synthetic sample...")
+    r = analyze(SAMPLE_LOG.splitlines(), top_n=3, burst_thresh=2)
+    print_report(r, top_n=3)
+
+def main():
+    ap = argparse.ArgumentParser(description="Quick triage of web access logs.")
+    ap.add_argument("logfile", nargs="?", help="Path to access log (default: STDIN)")
+    ap.add_argument("--top", type=int, default=5, help="How many top items to show (default: 5)")
+    ap.add_argument("--burst-thresh", type=int, default=15, help="Burst threshold per minute (default: 15)")
+    ap.add_argument("--self-test", action="store_true", help="Run built-in self test and exit")
+    args = ap.parse_args()
+
+    if args.self_test:
+        self_test()
+        return
+
+    if args.logfile:
+        try:
+            with open(args.logfile, "r", encoding="utf-8", errors="ignore") as fh:
+                lines = fh
+                report = analyze(lines, top_n=args.top, burst_thresh=args.burst_thresh)
+        except FileNotFoundError:
+            print(f"File not found: {args.logfile}", file=sys.stderr); sys.exit(2)
+    else:
+        report = analyze(sys.stdin, top_n=args.top, burst_thresh=args.burst_thresh)
+
+    print_report(report, args.top)
+
+if __name__ == "__main__":
+    main()
